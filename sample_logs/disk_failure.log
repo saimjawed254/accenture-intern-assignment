@@ -1,0 +1,4 @@
+[INFO] Copying artifacts directory...
+cp: error writing '/var/lib/runner/artifacts/bundle.tar.gz': No space left on device
+Error: Disk full. Write operation failed.
+Exit status 1.

@@ -1,0 +1,121 @@
+"""High-level build log analysis with Gemini only."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Any
+
+from .config import load_settings
+from .llm_client import GeminiClient
+from .parser import BuildLog
+from .prompts import SYSTEM_PROMPT, build_user_prompt
+from .schema import FailureDiagnosis, FailureType
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisResult:
+    """Final analysis payload returned to the CLI."""
+
+    diagnosis: FailureDiagnosis
+    used_llm: bool
+    llm_enabled: bool
+    error_message: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data = self.diagnosis.to_dict()
+        data["used_llm"] = self.used_llm
+        data["llm_enabled"] = self.llm_enabled
+        data["error_message"] = self.error_message
+        return data
+
+
+def analyze_build_log(build_log: BuildLog) -> AnalysisResult:
+    """Analyze a build log using Gemini only."""
+
+    settings = load_settings()
+    client = GeminiClient(settings)
+
+    if not client.is_configured():
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+
+    user_prompt = build_user_prompt(build_log)
+
+    try:
+        response = client.generate_json(system_prompt=SYSTEM_PROMPT, user_prompt=user_prompt)
+        diagnosis = _parse_llm_response(response.text)
+        return AnalysisResult(
+            diagnosis=diagnosis,
+            used_llm=True,
+            llm_enabled=True,
+        )
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"Gemini analysis failed: {exc}") from exc
+
+
+def _parse_llm_response(text: str) -> FailureDiagnosis:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise RuntimeError("Gemini response did not contain valid JSON")
+
+    try:
+        payload = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        raise RuntimeError("Gemini response JSON could not be parsed")
+
+    return _diagnosis_from_payload(payload)
+
+
+def _diagnosis_from_payload(payload: dict[str, Any]) -> FailureDiagnosis:
+    failure_type = _parse_failure_type(payload.get("failure_type"))
+    confidence = _normalized_text(payload.get("confidence"), default="UNCERTAIN")
+    root_cause = _normalized_text(payload.get("root_cause"), default="Gemini did not provide a root cause.")
+    evidence = _normalized_text(payload.get("evidence"), default="Gemini did not provide evidence.")
+    fix_steps = _parse_fix_steps(payload.get("fix_steps"))
+
+    return FailureDiagnosis(
+        failure_type=failure_type,
+        confidence=confidence,
+        matched_pattern="gemini-json",
+        evidence=evidence,
+        root_cause=root_cause,
+        fix_steps=fix_steps,
+        suggested_fix=_suggest_fix(fix_steps, root_cause),
+        source="gemini",
+        raw_model_output=json.dumps(payload, ensure_ascii=False),
+    )
+
+
+def _parse_failure_type(value: Any) -> FailureType:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        for failure_type in FailureType:
+            if failure_type.value == normalized:
+                return failure_type
+    return FailureType.UNKNOWN
+
+
+def _parse_fix_steps(value: Any) -> tuple[str, ...]:
+    if isinstance(value, list):
+        steps = tuple(str(item).strip() for item in value if str(item).strip())
+        if steps:
+            return steps
+    return (
+        "Review the raw log and identify the first error line.",
+        "Refine the prompt or fix the workflow/configuration based on the error.",
+    )
+
+
+def _normalized_text(value: Any, *, default: str) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return default
+
+
+def _suggest_fix(fix_steps: tuple[str, ...], root_cause: str) -> str:
+    if fix_steps:
+        return fix_steps[0]
+    return root_cause
