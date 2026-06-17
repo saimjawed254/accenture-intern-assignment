@@ -45,10 +45,12 @@ def trigger_workflow_rerun(repo: str, run_id: int, token: str) -> None:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "CI-Build-Assistant",
+        "Content-Length": "0",
     }
 
     http_request = request.Request(
         url,
+        data=b"",
         headers=headers,
         method="POST",
     )
