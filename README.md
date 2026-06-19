@@ -1,6 +1,7 @@
 # AI-Powered CI/CD Build Assistant
 
-Testing attempt 1
+Testing attempt 1 passed
+Retrying : attempt 2 
 
 Week 2 of the CI/CD build assistant is now wired for Gemini-backed structured diagnosis only.
 
