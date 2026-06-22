@@ -23,6 +23,9 @@ Add it as a repository secret:
 
 Open your existing CI workflow file (e.g. `.github/workflows/ci.yml`).
 
+> [!NOTE]
+> **Don't have a CI workflow yet?** Simply create a new file named `.github/workflows/ci.yml` in your repository, and copy-paste the [Full Example](#full-example) template below as your starting point.
+
 You need to do two things:
 
 **A) Pipe your test output to a log file.** Modify your test step so the output is saved, and make sure `shell: bash` is explicitly set to ensure `pipefail` causes the step to fail:
@@ -219,15 +222,17 @@ jobs:
 
 ---
 
-## Action Inputs
+## Action Configuration (Inputs)
 
-| Input | Required | Default | Description |
+When adding this Action to your custom workflow files, you can configure these inputs under the `with:` block:
+
+| Input | Required | Default | When to use / Description |
 | :--- | :--- | :--- | :--- |
-| `log-file` | No | `none` | Path to the build log file (not needed for `apply-fix` mode) |
-| `gemini-api-key` | Yes | — | Your Gemini API key |
-| `gemini-model` | No | `gemini-3.1-flash-lite` | Gemini model to use |
-| `mode` | No | `agent` | `agent` (PR comments + retry), `diagnose` (log output only), or `apply-fix` (apply suggested code changes) |
-| `github-token` | No | `github.token` | Token for PR commenting (auto-provided by GitHub) |
+| `gemini-api-key` | **Yes** | — | **Required**. Your Google Gemini API key from AI Studio. |
+| `log-file` | No | `none` | The path to the build log file you want to analyze (e.g. `build_failure.log`). Not needed in `apply-fix` mode. |
+| `mode` | No | `agent` | **How the assistant executes:**<br>• `agent` (Default): Posts PR diagnostic reports and prepares log metadata for auto-retry.<br>• `diagnose`: Runs local analysis and prints to the build runner console only.<br>• `apply-fix`: Applies suggested code modifications from a PR comment directly to the branch. |
+| `gemini-model` | No | `gemini-3.1-flash-lite` | The AI model used. You can change this to another Google model (e.g., `gemini-1.5-flash` or `gemini-1.5-pro`) if needed. |
+| `github-token` | No | `github.token` | The GitHub token used to write PR comments. Auto-provided by GitHub Actions. |
 
 ---
 
