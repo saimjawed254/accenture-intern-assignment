@@ -93,6 +93,7 @@ class GeminiClient:
                         "fix_steps",
                         "confidence",
                         "evidence",
+                        "file_changes",
                     ],
                     "propertyOrdering": [
                         "failure_type",

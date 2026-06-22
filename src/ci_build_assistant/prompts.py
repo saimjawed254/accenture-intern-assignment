@@ -29,7 +29,8 @@ SYSTEM_PROMPT = dedent(
     }
 
     Rules for file_changes:
-    - Only include file_changes when you are confident about the exact code fix.
+    - Prioritize providing exact code fixes in "file_changes" whenever possible, especially for test assertion mismatches, compilation errors, and simple code bugs that are visible in stack traces.
+    - If the log shows a test assertion failing (e.g. expected value vs received value), prioritize suggesting the code fix that updates the assertion or test to pass in the CI environment.
     - The "search" field MUST exactly match existing code in the file, including all whitespace and indentation. Do NOT guess or paraphrase.
     - The "action" field must be "modify", "create", or "delete".
     - For "create": "search" should be empty, "replace" contains the full file content.
