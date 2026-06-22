@@ -1,4 +1,4 @@
-"""Autonomous agent loop implementing the Observe-Reason-Act-Check cycle."""
+"""Autonomous agent loop and analysis orchestration for CI Build Assistant."""
 
 from __future__ import annotations
 
@@ -6,19 +6,197 @@ import json
 import os
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from .config import load_settings
-from .parser import BuildLog
-from .memory import get_log_signature, get_past_attempts, record_attempt
-from .analysis import analyze_build_log
-from .schema import FileChange
-from .tools import post_pr_comment, get_pr_comments
+from .classifier import classify_failure
+from .core import (
+    BuildLog,
+    FailureDiagnosis,
+    FailureType,
+    FileChange,
+    get_log_signature,
+    get_past_attempts,
+    get_pr_comments,
+    load_settings,
+    post_pr_comment,
+    record_attempt,
+)
+from .llm_client import GeminiClient, SYSTEM_PROMPT, build_user_prompt
 
 
-# ---------------------------------------------------------------------------
-# Diff preview helper
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 1. High-Level Analysis Orchestration
+# ===========================================================================
+
+@dataclass(frozen=True, slots=True)
+class AnalysisResult:
+    """Final analysis payload returned to the CLI."""
+
+    diagnosis: FailureDiagnosis
+    used_llm: bool
+    llm_enabled: bool
+    error_message: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data = self.diagnosis.to_dict()
+        data["used_llm"] = self.used_llm
+        data["llm_enabled"] = self.llm_enabled
+        data["error_message"] = self.error_message
+        return data
+
+
+def analyze_build_log(build_log: BuildLog, past_attempts: list[str] | None = None) -> AnalysisResult:
+    """Analyze a build log using Gemini with a rule-based fallback."""
+
+    settings = load_settings()
+    client = GeminiClient(settings)
+    llm_enabled = client.is_configured()
+
+    if llm_enabled:
+        try:
+            user_prompt = build_user_prompt(build_log, past_attempts)
+            response = client.generate_json(system_prompt=SYSTEM_PROMPT, user_prompt=user_prompt)
+            diagnosis = _parse_llm_response(response.text)
+            return AnalysisResult(
+                diagnosis=diagnosis,
+                used_llm=True,
+                llm_enabled=True,
+            )
+        except Exception as exc:
+            print(f"Warning: Gemini analysis failed ({exc}). Falling back to rule-based classifier.", file=sys.stderr)
+            diagnosis = classify_failure(build_log)
+            return AnalysisResult(
+                diagnosis=diagnosis,
+                used_llm=False,
+                llm_enabled=True,
+                error_message=str(exc),
+            )
+    else:
+        print("Warning: GEMINI_API_KEY is not configured. Falling back to rule-based classifier.", file=sys.stderr)
+        diagnosis = classify_failure(build_log)
+        return AnalysisResult(
+            diagnosis=diagnosis,
+            used_llm=False,
+            llm_enabled=False,
+            error_message="GEMINI_API_KEY not set",
+        )
+
+
+def _parse_llm_response(text: str) -> FailureDiagnosis:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise RuntimeError("Gemini response did not contain valid JSON")
+
+    try:
+        payload = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        raise RuntimeError("Gemini response JSON could not be parsed")
+
+    return _diagnosis_from_payload(payload)
+
+
+def _diagnosis_from_payload(payload: dict[str, Any]) -> FailureDiagnosis:
+    failure_type = _parse_failure_type(payload.get("failure_type"))
+    confidence = _normalized_text(payload.get("confidence"), default="UNCERTAIN")
+    root_cause = _normalized_text(payload.get("root_cause"), default="Gemini did not provide a root cause.")
+    evidence = _normalized_text(payload.get("evidence"), default="Gemini did not provide evidence.")
+    fix_steps = _parse_fix_steps(payload.get("fix_steps"))
+    file_changes = _parse_file_changes(payload.get("file_changes"))
+
+    return FailureDiagnosis(
+        failure_type=failure_type,
+        confidence=confidence,
+        matched_pattern="gemini-json",
+        evidence=evidence,
+        root_cause=root_cause,
+        fix_steps=fix_steps,
+        suggested_fix=_suggest_fix(fix_steps, root_cause),
+        source="gemini",
+        raw_model_output=json.dumps(payload, ensure_ascii=False),
+        file_changes=file_changes,
+    )
+
+
+def _parse_failure_type(value: Any) -> FailureType:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        for failure_type in FailureType:
+            if failure_type.value == normalized:
+                return failure_type
+    return FailureType.UNKNOWN
+
+
+def _parse_fix_steps(value: Any) -> tuple[str, ...]:
+    if isinstance(value, list):
+        steps = tuple(str(item).strip() for item in value if str(item).strip())
+        if steps:
+            return steps
+    return (
+        "Review the raw log and identify the first error line.",
+        "Refine the prompt or fix the workflow/configuration based on the error.",
+    )
+
+
+def _normalized_text(value: Any, *, default: str) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return default
+
+
+def _parse_file_changes(value: Any) -> tuple[FileChange, ...]:
+    """Parse the file_changes array from the Gemini JSON payload, enforcing safety limits."""
+
+    if not isinstance(value, list):
+        return ()
+    changes = []
+    total_lines = 0
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        path = item.get("path", "").strip()
+        if not path:
+            continue
+            
+        search = item.get("search", "")
+        replace = item.get("replace", "")
+        action = item.get("action", "modify").strip().lower()
+
+        # Count lines in search and replace blocks
+        search_lines = search.count("\n") + 1 if search else 0
+        replace_lines = replace.count("\n") + 1 if replace else 0
+
+        # Enforce max 50 lines per block
+        if search_lines > 50 or replace_lines > 50:
+            print("Warning: Suggested file change block is too large (> 50 lines), skipping auto-fix suggestion.", file=sys.stderr)
+            return ()
+
+        total_lines += max(search_lines, replace_lines)
+        # Enforce max 150 lines cumulative across all changes
+        if total_lines > 150:
+            print("Warning: Total suggested file changes are too large (> 150 lines), skipping auto-fix suggestion.", file=sys.stderr)
+            return ()
+
+        changes.append(FileChange(
+            path=path,
+            search=search,
+            replace=replace,
+            action=action,
+        ))
+    return tuple(changes)
+
+
+def _suggest_fix(fix_steps: tuple[str, ...], root_cause: str) -> str:
+    if fix_steps:
+        return fix_steps[0]
+    return root_cause
+
+
+# ===========================================================================
+# 2. Diff Preview Rendering
+# ===========================================================================
 
 def generate_diff_preview(file_changes: tuple[FileChange, ...]) -> str:
     """Render file changes as a GitHub-flavored markdown diff block."""
@@ -44,35 +222,23 @@ def generate_diff_preview(file_changes: tuple[FileChange, ...]) -> str:
             for line in fc.replace.splitlines():
                 parts.append(f"+ {line}")
         else:
-            # Modify: show removed lines then added lines
             for line in fc.search.splitlines():
                 parts.append(f"- {line}")
             for line in fc.replace.splitlines():
                 parts.append(f"+ {line}")
 
         parts.append("```")
-        parts.append("")  # blank line between files
+        parts.append("")
 
     return "\n".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# Main agent loop
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 3. Main Agent Loop
+# ===========================================================================
 
 def run_agent_loop(build_log: BuildLog, project_root: Path | None = None) -> bool:
-    """Execute the autonomous CI/CD recovery agent loop.
-
-    1. Observe: Parse build log and generate SHA-256 error signature.
-    2. Check Memory: Retrieve past failed attempts.
-    3. Safety Guardrails: Halt if consecutive retries >= 3.
-    4. Reason: Call Gemini to obtain a diagnosis, avoiding past failed steps.
-    5. Act:
-       - Post diagnosis details as a PR comment with visual diff preview.
-       - Embed file_changes metadata for /apply-fix ChatOps trigger.
-       - Save attempt status to local memory.
-       - Re-run is handled by a separate retry workflow.
-    """
+    """Execute the autonomous Observe-Reason-Act recovery cycle."""
 
     root = project_root or Path.cwd()
     settings = load_settings(root)
@@ -97,7 +263,6 @@ def run_agent_loop(build_log: BuildLog, project_root: Path | None = None) -> boo
             for comment in comments:
                 matches = re.findall(r"<!--\s*build_assistant_metadata:\s*(.*?)\s*-->", comment)
                 for match in matches:
-                    # Try to parse as JSON metadata (new format)
                     try:
                         meta = json.loads(match)
                         if isinstance(meta, dict):
@@ -125,7 +290,7 @@ def run_agent_loop(build_log: BuildLog, project_root: Path | None = None) -> boo
         except Exception as exc:
             print(f"Warning: Failed to fetch/parse PR comments for history: {exc}", file=sys.stderr)
 
-    # Merge local history attempts with PR comments attempts, preserving order and uniqueness
+    # Merge unique attempts
     unique_attempts = []
     for attempt in past_attempts + pr_attempts:
         if attempt not in unique_attempts:
@@ -145,14 +310,14 @@ def run_agent_loop(build_log: BuildLog, project_root: Path | None = None) -> boo
     print(f"Starting CI recovery agent. Log signature: {signature}")
     print(f"Historical attempts detected: {len(past_attempts)}")
 
-    # 4. Reason: Run diagnosis with memory context
+    # 4. Reason: Run diagnosis
     try:
         analysis = analyze_build_log(build_log, past_attempts)
     except Exception as exc:
         print(f"Agent loop reasoning failed: {exc}", file=sys.stderr)
         return False
 
-    # Write transient status to file for retry workflow to consume
+    # Write transient status to file for retry workflow
     try:
         transient_types = {"network_timeout", "oom_error", "disk_full", "permission_denied", "unknown"}
         is_transient = analysis.diagnosis.failure_type.value in transient_types
@@ -163,7 +328,7 @@ def run_agent_loop(build_log: BuildLog, project_root: Path | None = None) -> boo
     diagnosis = analysis.diagnosis
     suggested_fix = diagnosis.suggested_fix
 
-    # Extra safety guardrail: if Gemini returns a fix we already attempted, override it
+    # Handle duplicate fix overriding
     if suggested_fix in past_attempts:
         print("Warning: LLM returned a suggestion that has already failed. Overriding.")
         alternate_fixes = [step for step in diagnosis.fix_steps if step not in past_attempts]
@@ -177,12 +342,12 @@ def run_agent_loop(build_log: BuildLog, project_root: Path | None = None) -> boo
     print(f"Reasoned Fix Proposal: {suggested_fix}")
 
     if not token or not repo:
-        print("\nWarning: GITHUB_TOKEN or GITHUB_REPOSITORY is not set in settings.")
-        print("Saving attempt locally, but skipping GitHub API interactions.")
+        print("\nWarning: GITHUB_TOKEN or GITHUB_REPOSITORY is not set.")
+        print("Saving attempt locally, but skipping GitHub API comments.")
         record_attempt(history_file, signature, suggested_fix, "failed")
         return False
 
-    # Act Part A: Post PR Comment with diff preview
+    # 5. Act: Post PR Comment
     if pr_number:
         print(f"Posting diagnostic report comment to PR #{pr_number}...")
         comment_body = (
@@ -197,7 +362,6 @@ def run_agent_loop(build_log: BuildLog, project_root: Path | None = None) -> boo
         for idx, step in enumerate(diagnosis.fix_steps, 1):
             comment_body += f"{idx}. {step}\n"
 
-        # Add diff preview if file changes are available
         if diagnosis.file_changes:
             diff_preview = generate_diff_preview(diagnosis.file_changes)
             comment_body += f"\n---\n\n#### 📝 Suggested Code Changes:\n\n{diff_preview}\n"
@@ -206,7 +370,6 @@ def run_agent_loop(build_log: BuildLog, project_root: Path | None = None) -> boo
 
         comment_body += f"\n*Attempt #{len(past_attempts) + 1}. A re-run will be triggered automatically.*"
 
-        # Embed structured metadata for /apply-fix to consume
         metadata = {
             "signature": signature,
             "suggested_fix": suggested_fix,
@@ -222,10 +385,8 @@ def run_agent_loop(build_log: BuildLog, project_root: Path | None = None) -> boo
         except Exception as exc:
             print(f"Warning: failed to post PR comment: {exc}", file=sys.stderr)
     else:
-        print("No GITHUB_PR_NUMBER environment variable found. Skipping PR comment tool.")
+        print("No GITHUB_PR_NUMBER env found. Skipping PR comment.")
 
-    # Act Part B: Record attempt in memory
+    # Record attempt in history database
     record_attempt(history_file, signature, suggested_fix, "running")
-    print("Diagnosis complete. Re-run will be triggered by the retry workflow.")
     return True
-

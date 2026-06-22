@@ -1,19 +1,38 @@
 """CI build assistant package."""
 
-from .analysis import AnalysisResult, analyze_build_log
-from .parser import BuildLog, read_build_log
-from .schema import FailureDiagnosis, FailureType, FileChange
-from .agent import run_agent_loop, generate_diff_preview
+from .core import (
+    BuildLog,
+    FailureDiagnosis,
+    FailureType,
+    FileChange,
+    get_pr_branch,
+    get_pr_comments,
+    load_settings,
+    post_comment_reaction,
+    post_pr_comment,
+    read_build_log,
+)
+from .agent import (
+    AnalysisResult,
+    analyze_build_log,
+    generate_diff_preview,
+    run_agent_loop,
+)
 
 __all__ = [
-	"AnalysisResult",
-	"BuildLog",
-	"FailureDiagnosis",
-	"FailureType",
-	"FileChange",
-	"analyze_build_log",
-	"generate_diff_preview",
-	"read_build_log",
-	"run_agent_loop",
+    "AnalysisResult",
+    "BuildLog",
+    "FailureDiagnosis",
+    "FailureType",
+    "FileChange",
+    "analyze_build_log",
+    "generate_diff_preview",
+    "read_build_log",
+    "run_agent_loop",
+    "load_settings",
+    "get_pr_comments",
+    "post_pr_comment",
+    "get_pr_branch",
+    "post_comment_reaction",
 ]
 

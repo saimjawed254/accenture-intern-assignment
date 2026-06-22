@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .parser import BuildLog
-from .schema import FailureDiagnosis, FailureType
+from .core import BuildLog, FailureDiagnosis, FailureType
 
 
 def classify_failure(build_log: BuildLog | str | Path) -> FailureDiagnosis:
