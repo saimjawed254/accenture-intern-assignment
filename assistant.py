@@ -260,12 +260,12 @@ def _run_apply_fix() -> int:
                 continue
 
             content = file_path.read_text(encoding="utf-8")
-            if search not in content:
+            new_content = _smart_replace(content, search, replace)
+            if new_content is None:
                 print(f"    ❌ Search block not found in {fc['path']}.", file=sys.stderr)
                 print("    The code has changed since this fix was suggested. Please re-run the tests.", file=sys.stderr)
                 continue
 
-            new_content = content.replace(search, replace, 1)
             file_path.write_text(new_content, encoding="utf-8")
             applied_count += 1
         else:
@@ -304,6 +304,75 @@ def _run_apply_fix() -> int:
 
     print("🚀 Changes committed and pushed. CI will re-run automatically.")
     return 0
+
+
+def _smart_replace(content: str, search: str, replace: str) -> str | None:
+    """Safely replace search block with replace block in content,
+    resilient to line-ending mismatches and minor indentation differences."""
+
+    # 1. Try exact match first
+    if search in content:
+        return content.replace(search, replace, 1)
+
+    # 2. Try normalizing line endings (Windows CRLF vs Linux LF)
+    search_lf = search.replace("\r\n", "\n")
+    content_lf = content.replace("\r\n", "\n")
+    if search_lf in content_lf:
+        has_crlf = "\r\n" in content
+        ending = "\r\n" if has_crlf else "\n"
+        replace_normalized = replace.replace("\r\n", "\n").replace("\n", ending)
+        search_normalized = search.replace("\r\n", "\n").replace("\n", ending)
+        if search_normalized in content:
+            return content.replace(search_normalized, replace_normalized, 1)
+        replaced_lf = content_lf.replace(search_lf, replace.replace("\r\n", "\n"), 1)
+        return replaced_lf.replace("\n", ending) if has_crlf else replaced_lf
+
+    # 3. Try matching with fuzzy indentation / stripped lines
+    search_lines = [line.strip() for line in search.splitlines() if line.strip()]
+    if not search_lines:
+        return None
+
+    content_lines = content.splitlines()
+    n_search = len(search_lines)
+    n_content = len(content_lines)
+
+    for i in range(n_content - n_search + 1):
+        match = True
+        for j in range(n_search):
+            if content_lines[i + j].strip() != search_lines[j]:
+                match = False
+                break
+
+        if match:
+            # Reconstruct the replacement with the matched indentation of the file
+            first_line = content_lines[i]
+            indentation = first_line[:len(first_line) - len(first_line.lstrip())]
+
+            replace_lines = replace.splitlines()
+            new_replace_lines = []
+            for r_line in replace_lines:
+                if not r_line.strip():
+                    new_replace_lines.append("")
+                else:
+                    new_replace_lines.append(indentation + r_line.lstrip())
+
+            has_crlf = "\r\n" in content
+            ending = "\r\n" if has_crlf else "\n"
+
+            before = ending.join(content_lines[:i])
+            middle = ending.join(new_replace_lines)
+            after = ending.join(content_lines[i + n_search:])
+
+            parts = []
+            if before:
+                parts.append(before)
+            parts.append(middle)
+            if after:
+                parts.append(after)
+
+            return ending.join(parts) + (ending if content.endswith(ending) else "")
+
+    return None
 
 
 def _git_commit_and_push(root: Path, repo: str, token: str, branch: str) -> None:
