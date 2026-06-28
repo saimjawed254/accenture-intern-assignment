@@ -106,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
     # Write transient status to file for retry workflow to consume
     try:
         transient_types = {"network_timeout", "oom_error", "disk_full", "permission_denied", "unknown"}
-        is_transient = analysis.diagnosis.failure_type.value in transient_types
+        is_transient = any(ft.value in transient_types for ft in analysis.diagnosis.failure_types)
         Path("transient_status.txt").write_text("true" if is_transient else "false", encoding="utf-8")
     except Exception as exc:
         print(f"Warning: Could not write transient status: {exc}", file=sys.stderr)
