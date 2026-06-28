@@ -252,16 +252,17 @@ def _run_apply_fix() -> int:
         return 0
 
     # Find the most recent Build Assistant metadata comment.
-    # To prevent re-applying an already-applied fix (same suggestions loop),
-    # we only search for metadata in comments posted AFTER the most recent
-    # /apply-fix command. This ensures we always pick up the newest diagnosis.
+    # We search backwards from the comment immediately preceding the /apply-fix command.
     metadata = None
-    search_comments = comments
-    if last_apply_fix_index >= 0:
-        # Only search comments after the last /apply-fix
-        search_comments = comments[last_apply_fix_index + 1:]
+    search_comments = comments[:last_apply_fix_index] if last_apply_fix_index >= 0 else comments
 
     for comment in reversed(search_comments):
+        stripped = comment.strip()
+        # Loop prevention: If we hit an older /apply-fix command before finding a diagnosis,
+        # it means the most recent diagnosis was already applied by that older command.
+        # We stop searching to prevent re-applying the same old fixes.
+        if stripped.startswith("/apply-fix"):
+            break
         matches = re.findall(r"<!--\s*build_assistant_metadata:\s*(.*?)\s*-->", comment)
         for match in matches:
             try:
